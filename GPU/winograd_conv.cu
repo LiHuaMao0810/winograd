@@ -203,47 +203,43 @@ void winograd_conv_kernel(const float* __restrict__ image,
         // 使用单个累加器数组
         float accumulator[16] = {0.0f};
 
-        // 循环处理输入通道
-        for (int c = 0; c < C; ++c) {
-            __syncthreads();
-            
-            // --- 协作加载变换后的卷积核到共享内存 ---
-            for (int load_idx = tid; load_idx < filter_shared_size; load_idx += total_threads) {
-                int k_local = load_idx / 16;  // 块内的输出通道索引
-                int filter_elem = load_idx % 16;  // 4x4矩阵中的元素索引
-                int k_global = blockIdx.z * blockDim.z + k_local;  // 全局输出通道索引
+                    // 循环处理输入通道
+            for (int c = 0; c < C; ++c) {
+                __syncthreads();
                 
-                if (k_global < K) {
-                    const float* u_kc = filter + (k_global * C + c) * 16;
-                    shared_filters[load_idx] = u_kc[filter_elem];
-                } else {
-                    shared_filters[load_idx] = 0.0f;
+                // --- 优化的串行加载策略（保持内存合并访问）---
+                // 先加载卷积核（较小的数据，快速完成）
+                for (int load_idx = tid; load_idx < filter_shared_size; load_idx += total_threads) {
+                    int k_local = load_idx / 16;
+                    int filter_elem = load_idx % 16;
+                    int k_global = blockIdx.z * blockDim.z + k_local;
+                    
+                    if (k_global < K) {
+                        const float* u_kc = filter + (k_global * C + c) * 16;
+                        shared_filters[load_idx] = u_kc[filter_elem];
+                    } else {
+                        shared_filters[load_idx] = 0.0f;
+                    }
                 }
-            }
-            
-            __syncthreads();
-            
-            // --- 协作加载输入数据到共享内存 ---
-            // 计算当前块需要的输入数据范围
-            int input_start_h = blockIdx.y * blockDim.y * 2;  // 块的起始高度
-            int input_start_w = blockIdx.x * blockDim.x * 2;  // 块的起始宽度
-            
-            for (int load_idx = tid; load_idx < input_shared_size; load_idx += total_threads) {
-                int local_h = load_idx / input_tile_w;
-                int local_w = load_idx % input_tile_w;
-                int global_h = input_start_h + local_h;
-                int global_w = input_start_w + local_w;
                 
-                // 边界检查和加载数据
-                if (global_h >= 0 && global_h < H && global_w >= 0 && global_w < W) {
-                    shared_input[load_idx] = image[(n * C + c) * H * W + global_h * W + global_w];
-                    // shared_input[load_idx] = image[n][c][global_h][global_w]
-                } else {
-                    shared_input[load_idx] = 0.0f;  // Zero padding
+                // 然后加载输入数据（保持连续的内存访问模式）
+                int input_start_h = blockIdx.y * blockDim.y * 2;
+                int input_start_w = blockIdx.x * blockDim.x * 2;
+                
+                for (int load_idx = tid; load_idx < input_shared_size; load_idx += total_threads) {
+                    int local_h = load_idx / input_tile_w;
+                    int local_w = load_idx % input_tile_w;
+                    int global_h = input_start_h + local_h;
+                    int global_w = input_start_w + local_w;
+                    
+                    if (global_h >= 0 && global_h < H && global_w >= 0 && global_w < W) {
+                        shared_input[load_idx] = image[(n * C + c) * H * W + global_h * W + global_w];
+                    } else {
+                        shared_input[load_idx] = 0.0f;  // Zero padding
+                    }
                 }
-            }
-            
-            __syncthreads();
+                
+                __syncthreads(); // 确保两个加载都完成
             
             // --- 从共享内存进行Winograd变换和计算 ---
             // 计算当前线程对应的输入数据在共享内存中的位置
@@ -367,7 +363,7 @@ void winograd_conv(thrust::device_vector<float>& image,
     int tiles_count = tiles_x * tiles_y;
     float sync_ratio = (float)(C * 3) / tiles_count;  // 同步开销与计算量比值
 
-    if (H * W <= 30*30 || sync_ratio > 8.0f) {
+    if (H * W <= 25*25 || sync_ratio > 5.0f) {
         // 小特征图或同步开销过大：使用1D无共享内存核函数
         printf("Using 1D kernel (small feature map or high sync overhead)\n");
         
@@ -387,11 +383,11 @@ void winograd_conv(thrust::device_vector<float>& image,
         // 根据特征图大小调整块配置
         dim3 blockDim;
         if (H * W > 80 * 80) {
-            // 超大特征图：优先空间并行
-            blockDim = dim3(8, 8, 8);
+            // 超大特征图：高线程利用率，适度通道并行
+            blockDim = dim3(8, 8, 12);  // 1024 threads - 最大线程数
         } else {
-            // 中大特征图：平衡空间和通道并行  
-            blockDim = dim3(4, 4, 16);
+            // 中大特征图：平衡空间和通道维度
+            blockDim = dim3(4, 4, 16);  // 256 threads - 避免过度同步
         }
         
         dim3 gridDim(
