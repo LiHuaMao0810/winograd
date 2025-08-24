@@ -27,6 +27,39 @@ __constant__ float A_T[2][4] = {
     {0.0f, 1.0f, -1.0f, -1.0f}
 };
 
+// 优化的输入变换 - 直接计算v = B^T @ d @ B，避免中间矩阵
+__device__ __forceinline__ void optimized_input_transform(const float d[16], float v[16]) {
+    // 根据测试程序输出的正确系数计算 v = B^T @ d @ B
+    v[0] = d[0] - d[2] - d[8] + d[10];
+    v[1] = d[1] + d[2] - d[9] - d[10];
+    v[2] = -d[1] + d[2] + d[9] - d[10];
+    v[3] = d[1] - d[3] - d[9] + d[11];
+    
+    v[4] = d[4] - d[6] + d[8] - d[10];
+    v[5] = d[5] + d[6] + d[9] + d[10];
+    v[6] = -d[5] + d[6] - d[9] + d[10];
+    v[7] = d[5] - d[7] + d[9] - d[11];
+    
+    v[8] = -d[4] + d[6] + d[8] - d[10];
+    v[9] = -d[5] - d[6] + d[9] + d[10];
+    v[10] = d[5] - d[6] - d[9] + d[10];
+    v[11] = -d[5] + d[7] + d[9] - d[11];
+    
+    v[12] = d[4] - d[6] - d[12] + d[14];
+    v[13] = d[5] + d[6] - d[13] - d[14];
+    v[14] = -d[5] + d[6] + d[13] - d[14];
+    v[15] = d[5] - d[7] - d[13] + d[15];
+}
+
+// 优化的输出变换 - 直接计算Y = A^T @ m @ A，避免中间矩阵
+__device__ __forceinline__ void optimized_output_transform(const float m[16], float Y[4]) {
+    // 根据测试程序输出的正确系数计算 Y = A^T @ m @ A
+    Y[0] = m[0] + m[1] + m[2] + m[4] + m[5] + m[6] + m[8] + m[9] + m[10];
+    Y[1] = m[1] - m[2] - m[3] + m[5] - m[6] - m[7] + m[9] - m[10] - m[11];
+    Y[2] = m[4] + m[5] + m[6] - m[8] - m[9] - m[10] - m[12] - m[13] - m[14];
+    Y[3] = m[5] - m[6] - m[7] - m[9] + m[10] + m[11] - m[13] + m[14] + m[15];
+}
+
 // Kernel to precompute filter transformations
 __global__
 void filter_transform_kernel(const float* __restrict__ filter,
@@ -103,39 +136,29 @@ void winograd_conv_kernel_1D(const float* __restrict__ image,
                 }
             }
         }
-        float v_ncp[4][4];
-        float temp_d[4][4];
+        // 使用优化的输入变换，避免中间矩阵存储
+        float d_flat[16], v_flat[16];
         for (int i = 0; i < 4; ++i) {
             for (int j = 0; j < 4; ++j) {
-                temp_d[i][j] = B_T[i][0] * d[0][j] + B_T[i][1] * d[1][j] + B_T[i][2] * d[2][j] + B_T[i][3] * d[3][j];
+                d_flat[i * 4 + j] = d[i][j];
             }
         }
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                v_ncp[i][j] = temp_d[i][0] * B[0][j] + temp_d[i][1] * B[1][j] + temp_d[i][2] * B[2][j] + temp_d[i][3] * B[3][j];
-            }
-        }
+        optimized_input_transform(d_flat, v_flat);
 
         // --- Element-wise product and accumulate ---
-        for (int i = 0; i < 4; ++i) {
-            for (int j = 0; j < 4; ++j) {
-                m[i][j] += u_kc[i * 4 + j] * v_ncp[i][j];
-            }
+        for (int i = 0; i < 16; ++i) {
+            m[i / 4][i % 4] += u_kc[i] * v_flat[i];
         }
     }
 
-    // --- Output Transform ---
-    float temp_m[2][4];
-    for (int i = 0; i < 2; ++i) {
+    // --- 使用优化的输出变换 ---
+    float m_flat[16], Y_flat[4];
+    for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < 4; ++j) {
-            temp_m[i][j] = A_T[i][0] * m[0][j] + A_T[i][1] * m[1][j] + A_T[i][2] * m[2][j] + A_T[i][3] * m[3][j];
+            m_flat[i * 4 + j] = m[i][j];
         }
     }
-    float Y[2][2];
-    for (int i = 0; i < 2; ++i) {
-        Y[i][0] = temp_m[i][0] + temp_m[i][1] + temp_m[i][2];
-        Y[i][1] = temp_m[i][1] - temp_m[i][2] - temp_m[i][3];
-    }
+    optimized_output_transform(m_flat, Y_flat);
 
     // --- Write output ---
     for (int i = 0; i < 2; ++i) {
@@ -143,7 +166,7 @@ void winograd_conv_kernel_1D(const float* __restrict__ image,
             int h = tile_y * 2 + i;
             int w = tile_x * 2 + j;
             if (h < outH && w < outW) {
-                output[((n * K + k) * outH + h) * outW + w] = Y[i][j];
+                output[((n * K + k) * outH + h) * outW + w] = Y_flat[i * 2 + j];
             }
         }
     }
@@ -249,40 +272,16 @@ void winograd_conv_kernel(const float* __restrict__ image,
             // 确保访问不越界，且当前线程在有效范围内
             if (tile_x < tiles_x && tile_y < tiles_y && k < K && 
                 local_h_start + 3 < input_tile_h && local_w_start + 3 < input_tile_w) {
-                // 提取4x4输入块
-                float temp[16];
+                // 提取4x4输入块并直接进行优化的输入变换
+                float d[16], v[16];
                 for (int i = 0; i < 4; ++i) {
                     for (int j = 0; j < 4; ++j) {
-                        temp[i * 4 + j] = shared_input[(local_h_start + i) * input_tile_w + (local_w_start + j)];
-                        // temp[i][j] = shared_input[2*y+i][2*x+j]
+                        d[i * 4 + j] = shared_input[(local_h_start + i) * input_tile_w + (local_w_start + j)];
                     }
                 }
                 
-                // 完整的输入变换: v = B^T @ temp @ B
-                float temp1[16];  // B^T @ temp 的结果
-                float v[16];      // B^T @ temp @ B 的最终结果
-                
-                // 步骤 1: temp1 = B^T @ temp
-                for (int i = 0; i < 4; ++i) {
-                    for (int j = 0; j < 4; ++j) {
-                        temp1[i * 4 + j] = 
-                            B_T[i][0] * temp[0 * 4 + j] +
-                            B_T[i][1] * temp[1 * 4 + j] +
-                            B_T[i][2] * temp[2 * 4 + j] +
-                            B_T[i][3] * temp[3 * 4 + j];
-                    }
-                }
-                
-                // 步骤 2: v = temp1 @ B
-                for (int i = 0; i < 4; ++i) {
-                    for (int j = 0; j < 4; ++j) {
-                        v[i * 4 + j] = 
-                            temp1[i * 4 + 0] * B[0][j] +
-                            temp1[i * 4 + 1] * B[1][j] +
-                            temp1[i * 4 + 2] * B[2][j] +
-                            temp1[i * 4 + 3] * B[3][j];
-                    }
-                }
+                // 使用优化的输入变换，避免中间矩阵
+                optimized_input_transform(d, v);
                 
                 // 获取对应的变换卷积核并进行逐元素乘积累加
                 int k_local = threadIdx.z;  // 块内的输出通道索引
@@ -297,32 +296,11 @@ void winograd_conv_kernel(const float* __restrict__ image,
             }
         }
 
-        // --- 输出变换 ---（只有有效线程进行输出变换和写入）
+        // --- 使用优化的输出变换 ---（只有有效线程进行输出变换和写入）
         if (tile_x < tiles_x && tile_y < tiles_y && k < K) {
-            // 计算 Y = A^T @ accumulator @ A
-            // 步骤 1: temp_out = A^T @ accumulator
-            float temp_out[8]; // 2x4 结果
-            for (int i = 0; i < 2; ++i) {
-                for (int j = 0; j < 4; ++j) {
-                    temp_out[i * 4 + j] = 
-                        A_T[i][0] * accumulator[0 * 4 + j] +
-                        A_T[i][1] * accumulator[1 * 4 + j] +
-                        A_T[i][2] * accumulator[2 * 4 + j] +
-                        A_T[i][3] * accumulator[3 * 4 + j];
-                }
-            }
-            
-            // 步骤 2: Y = temp_out @ A，其中A = A_T^T (A_T的转置)
-            // A_T = [[1,1,1,0], [0,1,-1,-1]], 所以 A = [[1,0], [1,1], [1,-1], [0,-1]]
-            float Y[4]; // 2x2 最终输出
-            for (int i = 0; i < 2; ++i) {
-                // 第一列 (j=0): A[:,0] = [1,1,1,0]
-                Y[i * 2 + 0] = temp_out[i * 4 + 0] * 1.0f + temp_out[i * 4 + 1] * 1.0f + 
-                               temp_out[i * 4 + 2] * 1.0f + temp_out[i * 4 + 3] * 0.0f;
-                // 第二列 (j=1): A[:,1] = [0,1,-1,-1]  
-                Y[i * 2 + 1] = temp_out[i * 4 + 0] * 0.0f + temp_out[i * 4 + 1] * 1.0f + 
-                               temp_out[i * 4 + 2] * (-1.0f) + temp_out[i * 4 + 3] * (-1.0f);
-            }
+            // 使用优化的输出变换，避免中间矩阵
+            float Y[4];
+            optimized_output_transform(accumulator, Y);
             
             // 步骤 3: 写入最终输出
             for (int i = 0; i < 2; ++i) {
