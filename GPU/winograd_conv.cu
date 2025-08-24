@@ -64,6 +64,92 @@ void filter_transform_kernel(const float* __restrict__ filter,
     }
 }
 
+__global__
+void winograd_conv_kernel_1D(const float* __restrict__ image,
+                          const float* __restrict__ filter,
+                          float* __restrict__ output,
+                          int N, int C, int H, int W, int K, int outH, int outW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_tiles = N * K * (outH / 2) * (outW / 2);
+    if (idx >= num_tiles) return;
+
+    // Decompose thread index to get (n, k, tile_y, tile_x)
+    int p_local = idx % ((outH / 2) * (outW / 2));
+    int k = (idx / ((outH / 2) * (outW / 2))) % K;
+    int n = idx / (K * (outH / 2) * (outW / 2));
+    int tile_y = p_local / (outW / 2);
+    int tile_x = p_local % (outW / 2);
+
+    float m[4][4] = {{0.0f}};
+
+    // Loop over input channels
+    for (int c = 0; c < C; ++c) {
+        // --- Load Precomputed Filter Transform ---
+        // Note: filter parameter now points to precomputed U matrix
+        const float* u_kc = filter + (k * C + c) * 16;
+        
+        // --- Image Transform ---
+        int h_start = tile_y * 2;
+        int w_start = tile_x * 2;
+        float d[4][4];
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                int global_h = h_start + i;
+                int global_w = w_start + j;
+                if (global_h >= 0 && global_h < H && global_w >= 0 && global_w < W) {
+                    d[i][j] = image[(n * C + c) * H * W + global_h * W + global_w];
+                } else {
+                    d[i][j] = 0.0f;  // Zero padding
+                }
+            }
+        }
+        float v_ncp[4][4];
+        float temp_d[4][4];
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                temp_d[i][j] = B_T[i][0] * d[0][j] + B_T[i][1] * d[1][j] + B_T[i][2] * d[2][j] + B_T[i][3] * d[3][j];
+            }
+        }
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                v_ncp[i][j] = temp_d[i][0] * B[0][j] + temp_d[i][1] * B[1][j] + temp_d[i][2] * B[2][j] + temp_d[i][3] * B[3][j];
+            }
+        }
+
+        // --- Element-wise product and accumulate ---
+        for (int i = 0; i < 4; ++i) {
+            for (int j = 0; j < 4; ++j) {
+                m[i][j] += u_kc[i * 4 + j] * v_ncp[i][j];
+            }
+        }
+    }
+
+    // --- Output Transform ---
+    float temp_m[2][4];
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 4; ++j) {
+            temp_m[i][j] = A_T[i][0] * m[0][j] + A_T[i][1] * m[1][j] + A_T[i][2] * m[2][j] + A_T[i][3] * m[3][j];
+        }
+    }
+    float Y[2][2];
+    for (int i = 0; i < 2; ++i) {
+        Y[i][0] = temp_m[i][0] + temp_m[i][1] + temp_m[i][2];
+        Y[i][1] = temp_m[i][1] - temp_m[i][2] - temp_m[i][3];
+    }
+
+    // --- Write output ---
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int h = tile_y * 2 + i;
+            int w = tile_x * 2 + j;
+            if (h < outH && w < outW) {
+                output[((n * K + k) * outH + h) * outW + w] = Y[i][j];
+            }
+        }
+    }
+}
+
+
 // Fused kernel for Winograd convolution F(2x2, 3x3) using precomputed filter transforms with shared memory optimization
 __global__
 void winograd_conv_kernel(const float* __restrict__ image,
@@ -275,32 +361,57 @@ void winograd_conv(thrust::device_vector<float>& image,
         filter.data().get(), U.data().get(), K, C
     );
     
-    // Step 2: 优化的 3D 分块，将 Z 维度改为仅处理输出通道
+    // Step 2: 自适应配置策略 - 根据特征图大小选择最优核函数
     int tiles_x = (outW + 1) / 2;  // X 方向的 tile 数量
     int tiles_y = (outH + 1) / 2;  // Y 方向的 tile 数量
-    
-    // 选择适合新映射的块维度
-    // blockDim.x = tile_x, blockDim.y = tile_y, blockDim.z = output_channel
-    dim3 blockDim(4, 4, 16);  // 每个块 512 个线程，有利于占用率
-    
-    // 计算网格维度以覆盖所有 (tile_x, tile_y, K) 组合
-    dim3 gridDim(
-        (tiles_x + blockDim.x - 1) / blockDim.x,  // Tile X 维度
-        (tiles_y + blockDim.y - 1) / blockDim.y,  // Tile Y 维度  
-        (K + blockDim.z - 1) / blockDim.z         // 输出通道维度
-    );
+    int tiles_count = tiles_x * tiles_y;
+    float sync_ratio = (float)(C * 3) / tiles_count;  // 同步开销与计算量比值
 
-    // 计算共享内存大小
-    int input_tile_h = blockDim.y * 2 + 2;
-    int input_tile_w = blockDim.x * 2 + 2;
-    int input_shared_size = input_tile_h * input_tile_w;
-    int filter_shared_size = 16 * blockDim.z;
-    size_t shared_memory_size = (input_shared_size + filter_shared_size) * sizeof(float);
+    if (H * W <= 30*30 || sync_ratio > 8.0f) {
+        // 小特征图或同步开销过大：使用1D无共享内存核函数
+        printf("Using 1D kernel (small feature map or high sync overhead)\n");
+        
+        int total_work = N * K * tiles_x * tiles_y;
+        int threads_per_block = 256;
+        int num_blocks = (total_work + threads_per_block - 1) / threads_per_block;
+        
+        winograd_conv_kernel_1D<<<num_blocks, threads_per_block>>>(
+            image.data().get(), U.data().get(), out.data().get(),
+            N, C, H, W, K, outH, outW
+        );
+        
+    } else {
+        // 大特征图：使用3D共享内存核函数
+        printf("Using 3D kernel (large feature map, shared memory beneficial)\n");
+        
+        // 根据特征图大小调整块配置
+        dim3 blockDim;
+        if (H * W > 80 * 80) {
+            // 超大特征图：优先空间并行
+            blockDim = dim3(8, 8, 8);
+        } else {
+            // 中大特征图：平衡空间和通道并行  
+            blockDim = dim3(4, 4, 16);
+        }
+        
+        dim3 gridDim(
+            (tiles_x + blockDim.x - 1) / blockDim.x,
+            (tiles_y + blockDim.y - 1) / blockDim.y,  
+            (K + blockDim.z - 1) / blockDim.z
+        );
+        
+        // 计算共享内存大小
+        int input_tile_h = blockDim.y * 2 + 2;
+        int input_tile_w = blockDim.x * 2 + 2;
+        int input_shared_size = input_tile_h * input_tile_w;
+        int filter_shared_size = 16 * blockDim.z;
+        size_t shared_memory_size = (input_shared_size + filter_shared_size) * sizeof(float);
 
-    winograd_conv_kernel<<<gridDim, blockDim, shared_memory_size>>>(
-        image.data().get(), U.data().get(), out.data().get(),
-        N, C, H, W, K, outH, outW
-    );
+        winograd_conv_kernel<<<gridDim, blockDim, shared_memory_size>>>(
+            image.data().get(), U.data().get(), out.data().get(),
+            N, C, H, W, K, outH, outW
+        );
+    }
 
     cudaDeviceSynchronize();
 }
