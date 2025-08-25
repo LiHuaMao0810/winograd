@@ -316,6 +316,367 @@ void winograd_conv_kernel(const float* __restrict__ image,
     }
 }
 
+// 修正的输入变换函数 - 保证正确性
+__device__ __forceinline__ void vectorized_input_transform_fixed(const float* d, float* v) {
+    // 为了保证正确性，直接使用原始计算公式
+    // 根据测试程序输出的正确系数计算 v = B^T @ d @ B
+    v[0] = d[0] - d[2] - d[8] + d[10];
+    v[1] = d[1] + d[2] - d[9] - d[10];
+    v[2] = -d[1] + d[2] + d[9] - d[10];
+    v[3] = d[1] - d[3] - d[9] + d[11];
+    
+    v[4] = d[4] - d[6] + d[8] - d[10];
+    v[5] = d[5] + d[6] + d[9] + d[10];
+    v[6] = -d[5] + d[6] - d[9] + d[10];
+    v[7] = d[5] - d[7] + d[9] - d[11];
+    
+    v[8] = -d[4] + d[6] + d[8] - d[10];
+    v[9] = -d[5] - d[6] + d[9] + d[10];
+    v[10] = d[5] - d[6] - d[9] + d[10];
+    v[11] = -d[5] + d[7] + d[9] - d[11];
+    
+    v[12] = d[4] - d[6] - d[12] + d[14];
+    v[13] = d[5] + d[6] - d[13] - d[14];
+    v[14] = -d[5] + d[6] + d[13] - d[14];
+    v[15] = d[5] - d[7] - d[13] + d[15];
+}
+
+// 向量化优化版本的输出变换 - 修正版本
+__device__ __forceinline__ void vectorized_output_transform_fixed(const float* m, float* Y) {
+    // 为了保证正确性，先恢复到逐元素计算
+    // 原始正确公式：
+    // Y[0] = m[0] + m[1] + m[2] + m[4] + m[5] + m[6] + m[8] + m[9] + m[10];
+    // Y[1] = m[1] - m[2] - m[3] + m[5] - m[6] - m[7] + m[9] - m[10] - m[11];
+    // Y[2] = m[4] + m[5] + m[6] - m[8] - m[9] - m[10] - m[12] - m[13] - m[14];
+    // Y[3] = m[5] - m[6] - m[7] - m[9] + m[10] + m[11] - m[13] + m[14] + m[15];
+    
+    Y[0] = m[0] + m[1] + m[2] + m[4] + m[5] + m[6] + m[8] + m[9] + m[10];
+    Y[1] = m[1] - m[2] - m[3] + m[5] - m[6] - m[7] + m[9] - m[10] - m[11];
+    Y[2] = m[4] + m[5] + m[6] - m[8] - m[9] - m[10] - m[12] - m[13] - m[14];
+    Y[3] = m[5] - m[6] - m[7] - m[9] + m[10] + m[11] - m[13] + m[14] + m[15];
+}
+
+// 优化的数据加载 - 一步完成压平
+__device__ __forceinline__ void load_tile_direct_optimized(
+    const float* __restrict__ image, 
+    int n, int c, int C, int H, int W, int h_start, int w_start, 
+    float* __restrict__ d_flat) {
+    
+    const float* base = image + (n * C + c) * H * W;
+    
+    // 展开循环，直接计算线性索引
+    #pragma unroll
+    for (int idx = 0; idx < 16; ++idx) {
+        int i = idx / 4;  // 行索引
+        int j = idx % 4;  // 列索引
+        int global_h = h_start + i;
+        int global_w = w_start + j;
+        
+        // 边界检查并加载
+        if (global_h >= 0 && global_h < H && global_w >= 0 && global_w < W) {
+            d_flat[idx] = base[global_h * W + global_w];
+        } else {
+            d_flat[idx] = 0.0f;  // Zero padding
+        }
+    }
+}
+
+// 向量化元素级乘法
+__device__ __forceinline__ void vectorized_elementwise_multiply_add(
+    const float* __restrict__ u_kc, 
+    const float* __restrict__ v, 
+    float* __restrict__ m) {
+    
+    // 使用float4向量化乘法，一次处理4个元素
+    const float4* u_vec = (const float4*)u_kc;
+    const float4* v_vec = (const float4*)v;
+    float4* m_vec = (float4*)m;
+    
+    // 展开循环，向量化计算
+    m_vec[0] = make_float4(
+        fmaf(u_vec[0].x, v_vec[0].x, m_vec[0].x),
+        fmaf(u_vec[0].y, v_vec[0].y, m_vec[0].y),
+        fmaf(u_vec[0].z, v_vec[0].z, m_vec[0].z),
+        fmaf(u_vec[0].w, v_vec[0].w, m_vec[0].w)
+    );
+    
+    m_vec[1] = make_float4(
+        fmaf(u_vec[1].x, v_vec[1].x, m_vec[1].x),
+        fmaf(u_vec[1].y, v_vec[1].y, m_vec[1].y),
+        fmaf(u_vec[1].z, v_vec[1].z, m_vec[1].z),
+        fmaf(u_vec[1].w, v_vec[1].w, m_vec[1].w)
+    );
+    
+    m_vec[2] = make_float4(
+        fmaf(u_vec[2].x, v_vec[2].x, m_vec[2].x),
+        fmaf(u_vec[2].y, v_vec[2].y, m_vec[2].y),
+        fmaf(u_vec[2].z, v_vec[2].z, m_vec[2].z),
+        fmaf(u_vec[2].w, v_vec[2].w, m_vec[2].w)
+    );
+    
+    m_vec[3] = make_float4(
+        fmaf(u_vec[3].x, v_vec[3].x, m_vec[3].x),
+        fmaf(u_vec[3].y, v_vec[3].y, m_vec[3].y),
+        fmaf(u_vec[3].z, v_vec[3].z, m_vec[3].z),
+        fmaf(u_vec[3].w, v_vec[3].w, m_vec[3].w)
+    );
+}
+
+// 优化版本的1D Winograd卷积核函数
+__global__
+void winograd_conv_kernel_1D_optimized(const float* __restrict__ image,
+                                      const float* __restrict__ filter,
+                                      float* __restrict__ output,
+                                      int N, int C, int H, int W, int K, int outH, int outW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_tiles = N * K * (outH / 2) * (outW / 2);
+    if (idx >= num_tiles) return;
+
+    // 解析线程索引
+    int p_local = idx % ((outH / 2) * (outW / 2));
+    int k = (idx / ((outH / 2) * (outW / 2))) % K;
+    int n = idx / (K * (outH / 2) * (outW / 2));
+    int tile_y = p_local / (outW / 2);
+    int tile_x = p_local % (outW / 2);
+
+    // 对齐的局部数组用于向量化操作
+    __align__(16) float m_flat[16] = {0.0f};
+
+    // 循环处理所有输入通道
+    for (int c = 0; c < C; ++c) {
+        // 获取预计算的滤波器变换
+        const float* u_kc = filter + (k * C + c) * 16;
+        
+        // 直接加载tile数据到展平数组，避免中间2D数组
+        __align__(16) float d_flat[16];
+        int h_start = tile_y * 2;
+        int w_start = tile_x * 2;
+        load_tile_direct_optimized(image, n, c, C, H, W, h_start, w_start, d_flat);
+        
+        // 使用修正的输入变换
+        __align__(16) float v_flat[16];
+        vectorized_input_transform_fixed(d_flat, v_flat);
+
+        // 使用fmaf指令进行融合乘加操作
+        #pragma unroll
+        for (int i = 0; i < 16; ++i) {
+            m_flat[i] = fmaf(u_kc[i], v_flat[i], m_flat[i]);
+        }
+    }
+
+    // 使用修正的输出变换
+    __align__(16) float Y_flat[4];
+    vectorized_output_transform_fixed(m_flat, Y_flat);
+
+    // 写入输出（保持原有逻辑）
+    for (int i = 0; i < 2; ++i) {
+        for (int j = 0; j < 2; ++j) {
+            int h = tile_y * 2 + i;
+            int w = tile_x * 2 + j;
+            if (h < outH && w < outW) {
+                output[((n * K + k) * outH + h) * outW + w] = Y_flat[i * 2 + j];
+            }
+        }
+    }
+}
+
+// 高效内联版本的1D Winograd卷积核函数 - 避免函数调用开销
+__global__
+void winograd_conv_kernel_1D_inline(const float* __restrict__ image,
+                                   const float* __restrict__ filter,
+                                   float* __restrict__ output,
+                                   int N, int C, int H, int W, int K, int outH, int outW) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int num_tiles = N * K * (outH / 2) * (outW / 2);
+    if (idx >= num_tiles) return;
+
+    // 解析线程索引
+    int p_local = idx % ((outH / 2) * (outW / 2));
+    int k = (idx / ((outH / 2) * (outW / 2))) % K;
+    int n = idx / (K * (outH / 2) * (outW / 2));
+    int tile_y = p_local / (outW / 2);
+    int tile_x = p_local % (outW / 2);
+
+    // SIMD对齐的局部累加矩阵
+    __align__(16) float m_flat[16] = {0.0f};
+
+    // 循环处理所有输入通道
+    for (int c = 0; c < C; ++c) {
+        // 获取预计算的滤波器变换
+        const float* u_kc = filter + (k * C + c) * 16;
+        
+        // === SIMD优化数据加载：使用float4向量化加载 ===
+        __align__(16) float d_flat[16];
+        const float* base = image + (n * C + c) * H * W;
+        int h_start = tile_y * 2;
+        int w_start = tile_x * 2;
+        
+        // 安全的数据加载：避免内存对齐问题
+        #pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            int global_h = h_start + i;
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                int global_w = w_start + j;
+                d_flat[i * 4 + j] = (global_h >= 0 && global_h < H && global_w >= 0 && global_w < W) 
+                                   ? base[global_h * W + global_w] : 0.0f;
+            }
+        }
+        
+        // === SIMD优化输入变换：使用float4向量化计算 ===
+        __align__(16) float v_flat[16];
+        
+        // 向量化加载d矩阵的行
+        float4 d_row0 = *((float4*)&d_flat[0]);   // d[0-3]
+        float4 d_row1 = *((float4*)&d_flat[4]);   // d[4-7]  
+        float4 d_row2 = *((float4*)&d_flat[8]);   // d[8-11]
+        float4 d_row3 = *((float4*)&d_flat[12]);  // d[12-15]
+        
+        // 向量化计算第一组：v[0-3]
+        float4 v_row0 = make_float4(
+            d_row0.x - d_row0.z - d_row2.x + d_row2.z,    // v[0] = d[0] - d[2] - d[8] + d[10]
+            d_row0.y + d_row0.z - d_row2.y - d_row2.z,    // v[1] = d[1] + d[2] - d[9] - d[10]
+            -d_row0.y + d_row0.z + d_row2.y - d_row2.z,   // v[2] = -d[1] + d[2] + d[9] - d[10]
+            d_row0.y - d_row0.w - d_row2.y + d_row2.w     // v[3] = d[1] - d[3] - d[9] + d[11]
+        );
+        
+        // 向量化计算第二组：v[4-7]
+        float4 v_row1 = make_float4(
+            d_row1.x - d_row1.z + d_row2.x - d_row2.z,    // v[4] = d[4] - d[6] + d[8] - d[10]
+            d_row1.y + d_row1.z + d_row2.y + d_row2.z,    // v[5] = d[5] + d[6] + d[9] + d[10]
+            -d_row1.y + d_row1.z - d_row2.y + d_row2.z,   // v[6] = -d[5] + d[6] - d[9] + d[10]
+            d_row1.y - d_row1.w + d_row2.y - d_row2.w     // v[7] = d[5] - d[7] + d[9] - d[11]
+        );
+        
+        // 向量化计算第三组：v[8-11]
+        float4 v_row2 = make_float4(
+            -d_row1.x + d_row1.z + d_row2.x - d_row2.z,   // v[8] = -d[4] + d[6] + d[8] - d[10]
+            -d_row1.y - d_row1.z + d_row2.y + d_row2.z,   // v[9] = -d[5] - d[6] + d[9] + d[10]
+            d_row1.y - d_row1.z - d_row2.y + d_row2.z,    // v[10] = d[5] - d[6] - d[9] + d[10]
+            -d_row1.y + d_row1.w + d_row2.y - d_row2.w    // v[11] = -d[5] + d[7] + d[9] - d[11]
+        );
+        
+        // 向量化计算第四组：v[12-15]
+        float4 v_row3 = make_float4(
+            d_row1.x - d_row1.z - d_row3.x + d_row3.z,    // v[12] = d[4] - d[6] - d[12] + d[14]
+            d_row1.y + d_row1.z - d_row3.y - d_row3.z,    // v[13] = d[5] + d[6] - d[13] - d[14]
+            -d_row1.y + d_row1.z + d_row3.y - d_row3.z,   // v[14] = -d[5] + d[6] + d[13] - d[14]
+            d_row1.y - d_row1.w - d_row3.y + d_row3.w     // v[15] = d[5] - d[7] - d[13] + d[15]
+        );
+        
+        // 向量化存储结果
+        *((float4*)&v_flat[0]) = v_row0;
+        *((float4*)&v_flat[4]) = v_row1;
+        *((float4*)&v_flat[8]) = v_row2;
+        *((float4*)&v_flat[12]) = v_row3;
+
+        // === 安全的SIMD优化元素级乘法：避免内存对齐问题 ===
+        // 安全地加载u和v数据，避免对齐问题
+        float4 u_vec0 = make_float4(u_kc[0], u_kc[1], u_kc[2], u_kc[3]);
+        float4 u_vec1 = make_float4(u_kc[4], u_kc[5], u_kc[6], u_kc[7]);
+        float4 u_vec2 = make_float4(u_kc[8], u_kc[9], u_kc[10], u_kc[11]);
+        float4 u_vec3 = make_float4(u_kc[12], u_kc[13], u_kc[14], u_kc[15]);
+        
+        float4 v_vec0 = *((float4*)&v_flat[0]);   // v_flat是对齐的
+        float4 v_vec1 = *((float4*)&v_flat[4]);
+        float4 v_vec2 = *((float4*)&v_flat[8]);
+        float4 v_vec3 = *((float4*)&v_flat[12]);
+        
+        float4 m_vec0 = *((float4*)&m_flat[0]);   // m_flat是对齐的
+        float4 m_vec1 = *((float4*)&m_flat[4]);
+        float4 m_vec2 = *((float4*)&m_flat[8]);
+        float4 m_vec3 = *((float4*)&m_flat[12]);
+        
+        // 向量化融合乘加：一次处理4个元素
+        m_vec0 = make_float4(
+            fmaf(u_vec0.x, v_vec0.x, m_vec0.x),
+            fmaf(u_vec0.y, v_vec0.y, m_vec0.y),
+            fmaf(u_vec0.z, v_vec0.z, m_vec0.z),
+            fmaf(u_vec0.w, v_vec0.w, m_vec0.w)
+        );
+        
+        m_vec1 = make_float4(
+            fmaf(u_vec1.x, v_vec1.x, m_vec1.x),
+            fmaf(u_vec1.y, v_vec1.y, m_vec1.y),
+            fmaf(u_vec1.z, v_vec1.z, m_vec1.z),
+            fmaf(u_vec1.w, v_vec1.w, m_vec1.w)
+        );
+        
+        m_vec2 = make_float4(
+            fmaf(u_vec2.x, v_vec2.x, m_vec2.x),
+            fmaf(u_vec2.y, v_vec2.y, m_vec2.y),
+            fmaf(u_vec2.z, v_vec2.z, m_vec2.z),
+            fmaf(u_vec2.w, v_vec2.w, m_vec2.w)
+        );
+        
+        m_vec3 = make_float4(
+            fmaf(u_vec3.x, v_vec3.x, m_vec3.x),
+            fmaf(u_vec3.y, v_vec3.y, m_vec3.y),
+            fmaf(u_vec3.z, v_vec3.z, m_vec3.z),
+            fmaf(u_vec3.w, v_vec3.w, m_vec3.w)
+        );
+        
+        // 向量化存储结果
+        *((float4*)&m_flat[0]) = m_vec0;
+        *((float4*)&m_flat[4]) = m_vec1;
+        *((float4*)&m_flat[8]) = m_vec2;
+        *((float4*)&m_flat[12]) = m_vec3;
+    }
+
+    // === SIMD优化输出变换：使用向量化计算 ===
+    // 向量化加载m矩阵
+    float4 m_row0 = *((float4*)&m_flat[0]);   // m[0-3]
+    float4 m_row1 = *((float4*)&m_flat[4]);   // m[4-7]
+    float4 m_row2 = *((float4*)&m_flat[8]);   // m[8-11]
+    float4 m_row3 = *((float4*)&m_flat[12]);  // m[12-15]
+    
+    // 向量化计算输出结果，使用fmaf进行更精确的计算
+    float4 Y_vec = make_float4(
+        // Y[0] = m[0] + m[1] + m[2] + m[4] + m[5] + m[6] + m[8] + m[9] + m[10]
+        fmaf(m_row0.x + m_row0.y + m_row0.z, 1.0f, 
+             fmaf(m_row1.x + m_row1.y + m_row1.z, 1.0f, 
+                  m_row2.x + m_row2.y + m_row2.z)),
+        
+        // Y[1] = m[1] - m[2] - m[3] + m[5] - m[6] - m[7] + m[9] - m[10] - m[11]
+        fmaf(m_row0.y - m_row0.z - m_row0.w, 1.0f,
+             fmaf(m_row1.y - m_row1.z - m_row1.w, 1.0f,
+                  m_row2.y - m_row2.z - m_row2.w)),
+        
+        // Y[2] = m[4] + m[5] + m[6] - m[8] - m[9] - m[10] - m[12] - m[13] - m[14]
+        fmaf(m_row1.x + m_row1.y + m_row1.z, 1.0f,
+             fmaf(-(m_row2.x + m_row2.y + m_row2.z), 1.0f,
+                  -(m_row3.x + m_row3.y + m_row3.z))),
+        
+        // Y[3] = m[5] - m[6] - m[7] - m[9] + m[10] + m[11] - m[13] + m[14] + m[15]
+        fmaf(m_row1.y - m_row1.z - m_row1.w, 1.0f,
+             fmaf(-(m_row2.y) + m_row2.z + m_row2.w, 1.0f,
+                  -m_row3.y + m_row3.z + m_row3.w))
+    );
+
+    // === SIMD优化输出写入：向量化边界检查和写入 ===
+    // 预计算输出位置
+    int h0 = tile_y * 2;
+    int w0 = tile_x * 2;
+    int h1 = h0 + 1;
+    int w1 = w0 + 1;
+    
+    // 向量化边界检查
+    bool valid[4] = {
+        h0 < outH && w0 < outW,  // Y[0]
+        h0 < outH && w1 < outW,  // Y[1]
+        h1 < outH && w0 < outW,  // Y[2]
+        h1 < outH && w1 < outW   // Y[3]
+    };
+    
+    // 条件写入（编译器会优化分支）
+    if (valid[0]) output[((n * K + k) * outH + h0) * outW + w0] = Y_vec.x;
+    if (valid[1]) output[((n * K + k) * outH + h0) * outW + w1] = Y_vec.y;
+    if (valid[2]) output[((n * K + k) * outH + h1) * outW + w0] = Y_vec.z;
+    if (valid[3]) output[((n * K + k) * outH + h1) * outW + w1] = Y_vec.w;
+}
+
+
+
 void winograd_conv(thrust::device_vector<float>& image,
                    thrust::device_vector<float>& filter, 
                    thrust::device_vector<float>& out,
@@ -341,51 +702,16 @@ void winograd_conv(thrust::device_vector<float>& image,
     int tiles_count = tiles_x * tiles_y;
     float sync_ratio = (float)(C * 3) / tiles_count;  // 同步开销与计算量比值
 
-    if (H * W <= 25*25 || sync_ratio > 5.0f) {
-        // 小特征图或同步开销过大：使用1D无共享内存核函数
-        printf("Using 1D kernel (small feature map or high sync overhead)\n");
+    
+    int total_work = N * K * tiles_x * tiles_y;
+    int threads_per_block = 256;
+    int num_blocks = (total_work + threads_per_block - 1) / threads_per_block;
         
-        int total_work = N * K * tiles_x * tiles_y;
-        int threads_per_block = 256;
-        int num_blocks = (total_work + threads_per_block - 1) / threads_per_block;
-        
-        winograd_conv_kernel_1D<<<num_blocks, threads_per_block>>>(
-            image.data().get(), U.data().get(), out.data().get(),
-            N, C, H, W, K, outH, outW
-        );
-        
-    } else {
-        // 大特征图：使用3D共享内存核函数
-        printf("Using 3D kernel (large feature map, shared memory beneficial)\n");
-        
-        // 根据特征图大小调整块配置
-        dim3 blockDim;
-        if (H * W > 80 * 80) {
-            // 超大特征图：高线程利用率，适度通道并行
-            blockDim = dim3(8, 8, 12);  // 1024 threads - 最大线程数
-        } else {
-            // 中大特征图：平衡空间和通道维度
-            blockDim = dim3(4, 4, 16);  // 256 threads - 避免过度同步
-        }
-        
-        dim3 gridDim(
-            (tiles_x + blockDim.x - 1) / blockDim.x,
-            (tiles_y + blockDim.y - 1) / blockDim.y,  
-            (K + blockDim.z - 1) / blockDim.z
-        );
-        
-        // 计算共享内存大小
-        int input_tile_h = blockDim.y * 2 + 2;
-        int input_tile_w = blockDim.x * 2 + 2;
-        int input_shared_size = input_tile_h * input_tile_w;
-        int filter_shared_size = 16 * blockDim.z;
-        size_t shared_memory_size = (input_shared_size + filter_shared_size) * sizeof(float);
-
-        winograd_conv_kernel<<<gridDim, blockDim, shared_memory_size>>>(
-            image.data().get(), U.data().get(), out.data().get(),
-            N, C, H, W, K, outH, outW
-        );
-    }
-
+    // 使用完全内联优化的1D kernel，避免函数调用开销
+    winograd_conv_kernel_1D_inline<<<num_blocks, threads_per_block>>>(
+        image.data().get(), U.data().get(), out.data().get(),
+        N, C, H, W, K, outH, outW
+    );
+    
     cudaDeviceSynchronize();
 }
