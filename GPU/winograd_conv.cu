@@ -573,193 +573,7 @@ void winograd_conv_kernel_1D_register_optimized(const float* __restrict__ image,
     if (h1 < outH && w1 < outW) output[out_base + h1 * outW + w1] = Y3;
 }
 
-// 寄存器复用优化版本 - 最小化寄存器使用，最大化复用效率
-__global__
-void winograd_conv_kernel_1D_register_reuse(const float* __restrict__ image,
-                                           const float* __restrict__ filter,
-                                           float* __restrict__ output,
-                                           int N, int C, int H, int W, int K, int outH, int outW) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int num_tiles = N * K * (outH / 2) * (outW / 2);
-    if (idx >= num_tiles) return;
 
-    // 解析线程索引
-    int p_local = idx % ((outH / 2) * (outW / 2));
-    int k = (idx / ((outH / 2) * (outW / 2))) % K;
-    int n = idx / (K * (outH / 2) * (outW / 2));
-    int tile_y = p_local / (outW / 2);
-    int tile_x = p_local % (outW / 2);
-
-    // 寄存器复用优化：只使用16个m寄存器 + 4个临时寄存器
-    register float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
-    register float m4 = 0.0f, m5 = 0.0f, m6 = 0.0f, m7 = 0.0f;
-    register float m8 = 0.0f, m9 = 0.0f, m10 = 0.0f, m11 = 0.0f;
-    register float m12 = 0.0f, m13 = 0.0f, m14 = 0.0f, m15 = 0.0f;
-    
-    // 复用寄存器：只用4个临时寄存器处理所有d、v、u值
-    register float temp0, temp1, temp2, temp3;
-
-    // 预计算地址偏移
-    const float* base = image + n * C * H * W;
-    int h_start = tile_y * 2;
-    int w_start = tile_x * 2;
-
-    // 循环处理所有输入通道
-    for (int c = 0; c < C; ++c) {
-        const float* u_kc = filter + (k * C + c) * 16;
-        const float* channel_base = base + c * H * W;
-        
-        // 分组处理：每次处理4个元素，最大化寄存器复用
-        // === 第一组：元素0-3 ===
-        {
-            // 加载d值到临时寄存器
-            int addr_base = h_start * W + w_start;
-            temp0 = (h_start >= 0 && h_start < H && w_start >= 0 && w_start < W) ? 
-                    channel_base[addr_base] : 0.0f;
-            temp1 = (h_start >= 0 && h_start < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f;
-            temp2 = (h_start >= 0 && h_start < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[addr_base + 2] : 0.0f;
-            temp3 = (h_start >= 0 && h_start < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[addr_base + 3] : 0.0f;
-            
-            // 复用temp0计算v0，然后立即使用并释放
-            temp0 = temp0 - temp2 - ((h_start + 2 >= 0 && h_start + 2 < H && w_start >= 0 && w_start < W) ? 
-                    channel_base[addr_base + 2*W] : 0.0f) + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[addr_base + 2*W + 2] : 0.0f);
-            m0 = fmaf(u_kc[0], temp0, m0);
-            
-            // 复用temp1计算v1
-            temp1 = temp1 + temp2 - ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 2*W + 1] : 0.0f) - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[addr_base + 2*W + 2] : 0.0f);
-            m1 = fmaf(u_kc[1], temp1, m1);
-            
-            // 复用temp2计算v2
-            temp2 = -((h_start >= 0 && h_start < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f) + temp2 + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 2*W + 1] : 0.0f) - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[addr_base + 2*W + 2] : 0.0f);
-            m2 = fmaf(u_kc[2], temp2, m2);
-            
-            // 复用temp3计算v3
-            temp3 = ((h_start >= 0 && h_start < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f) - temp3 - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 2*W + 1] : 0.0f) + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[addr_base + 2*W + 3] : 0.0f);
-            m3 = fmaf(u_kc[3], temp3, m3);
-        }
-        
-        // === 第二组：元素4-7 ===
-        {
-            int addr_base = (h_start + 1) * W + w_start;
-            temp0 = (h_start + 1 >= 0 && h_start + 1 < H && w_start >= 0 && w_start < W) ? 
-                    channel_base[addr_base] : 0.0f;
-            temp1 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f;
-            temp2 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[addr_base + 2] : 0.0f;
-            temp3 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[addr_base + 3] : 0.0f;
-            
-            // v4 = d4 - d6 + d8 - d10
-            temp0 = temp0 - temp2 + ((h_start + 2 >= 0 && h_start + 2 < H && w_start >= 0 && w_start < W) ? 
-                    channel_base[(h_start + 2) * W + w_start] : 0.0f) - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 2] : 0.0f);
-            m4 = fmaf(u_kc[4], temp0, m4);
-            
-            // v5 = d5 + d6 + d9 + d10
-            temp1 = temp1 + temp2 + ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 1] : 0.0f) + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 2] : 0.0f);
-            m5 = fmaf(u_kc[5], temp1, m5);
-            
-            // v6 = -d5 + d6 - d9 + d10
-            temp2 = -((h_start + 1 >= 0 && h_start + 1 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f) + temp2 - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 1] : 0.0f) + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 2] : 0.0f);
-            m6 = fmaf(u_kc[6], temp2, m6);
-            
-            // v7 = d5 - d7 + d9 - d11
-            temp3 = ((h_start + 1 >= 0 && h_start + 1 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[addr_base + 1] : 0.0f) - temp3 + 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 1] : 0.0f) - 
-                    ((h_start + 2 >= 0 && h_start + 2 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 3] : 0.0f);
-            m7 = fmaf(u_kc[7], temp3, m7);
-        }
-        
-        // === 第三组和第四组：类似的复用模式 ===
-        // 为了简化代码，这里继续使用相同的复用策略
-        // 实际实现时会处理剩余的v8-v15
-        
-        // 简化版本：直接计算剩余部分（在实际优化中会完全展开）
-        float d8 = (h_start + 2 >= 0 && h_start + 2 < H && w_start >= 0 && w_start < W) ? 
-                   channel_base[(h_start + 2) * W + w_start] : 0.0f;
-        float d9 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                   channel_base[(h_start + 2) * W + w_start + 1] : 0.0f;
-        float d10 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 2] : 0.0f;
-        float d11 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[(h_start + 2) * W + w_start + 3] : 0.0f;
-        float d12 = (h_start + 3 >= 0 && h_start + 3 < H && w_start >= 0 && w_start < W) ? 
-                    channel_base[(h_start + 3) * W + w_start] : 0.0f;
-        float d13 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                    channel_base[(h_start + 3) * W + w_start + 1] : 0.0f;
-        float d14 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                    channel_base[(h_start + 3) * W + w_start + 2] : 0.0f;
-        float d15 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                    channel_base[(h_start + 3) * W + w_start + 3] : 0.0f;
-        
-        // 继续处理v8-v15 使用寄存器复用
-        float d4 = (h_start + 1 >= 0 && h_start + 1 < H && w_start >= 0 && w_start < W) ? 
-                   channel_base[(h_start + 1) * W + w_start] : 0.0f;
-        float d5 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 1 >= 0 && w_start + 1 < W) ? 
-                   channel_base[(h_start + 1) * W + w_start + 1] : 0.0f;
-        float d6 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 2 >= 0 && w_start + 2 < W) ? 
-                   channel_base[(h_start + 1) * W + w_start + 2] : 0.0f;
-        float d7 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 3 >= 0 && w_start + 3 < W) ? 
-                   channel_base[(h_start + 1) * W + w_start + 3] : 0.0f;
-        
-        m8 = fmaf(u_kc[8], -d4 + d6 + d8 - d10, m8);
-        m9 = fmaf(u_kc[9], -d5 - d6 + d9 + d10, m9);
-        m10 = fmaf(u_kc[10], d5 - d6 - d9 + d10, m10);
-        m11 = fmaf(u_kc[11], -d5 + d7 + d9 - d11, m11);
-        
-        m12 = fmaf(u_kc[12], d4 - d6 - d12 + d14, m12);
-        m13 = fmaf(u_kc[13], d5 + d6 - d13 - d14, m13);
-        m14 = fmaf(u_kc[14], -d5 + d6 + d13 - d14, m14);
-        m15 = fmaf(u_kc[15], d5 - d7 - d13 + d15, m15);
-    }
-
-    // 输出变换：使用寄存器复用计算Y值
-    register float Y0 = m0 + m1 + m2 + m4 + m5 + m6 + m8 + m9 + m10;
-    register float Y1 = m1 - m2 - m3 + m5 - m6 - m7 + m9 - m10 - m11;
-    register float Y2 = m4 + m5 + m6 - m8 - m9 - m10 - m12 - m13 - m14;
-    register float Y3 = m5 - m6 - m7 - m9 + m10 + m11 - m13 + m14 + m15;
-
-    // 输出写入
-    int out_base = (n * K + k) * outH * outW;
-    int h0 = tile_y * 2, w0 = tile_x * 2;
-    int h1 = h0 + 1, w1 = w0 + 1;
-    
-    if (h0 < outH && w0 < outW) output[out_base + h0 * outW + w0] = Y0;
-    if (h0 < outH && w1 < outW) output[out_base + h0 * outW + w1] = Y1;
-    if (h1 < outH && w0 < outW) output[out_base + h1 * outW + w0] = Y2;
-    if (h1 < outH && w1 < outW) output[out_base + h1 * outW + w1] = Y3;
-}
 
 // 内存访问和指令级优化版本 - 减少冗余访问，优化指令流水线
 __global__
@@ -907,6 +721,153 @@ void winograd_conv_kernel_1D_optimized_pipeline(const float* __restrict__ image,
 }
 
 
+
+// 批处理优化版本 - 每个线程处理多个tiles，分摊启动开销，提升计算密度
+__global__
+void winograd_conv_kernel_1D_batched(const float* __restrict__ image,
+                                    const float* __restrict__ filter,
+                                    float* __restrict__ output,
+                                    int N, int C, int H, int W, int K, int outH, int outW) {
+    // 批处理参数 - 每个线程处理多个tiles
+    const int TILES_PER_THREAD = 3;  // 每线程处理3个tiles，平衡寄存器使用和计算密度
+    
+    int thread_id = blockIdx.x * blockDim.x + threadIdx.x;
+    int total_tiles = N * K * (outH / 2) * (outW / 2);
+    
+    // 批处理循环 - 每个线程处理TILES_PER_THREAD个tiles
+    for (int batch = 0; batch < TILES_PER_THREAD; ++batch) {
+        int idx = thread_id * TILES_PER_THREAD + batch;
+        if (idx >= total_tiles) break;  // 早期退出，避免无效计算
+
+        // 解析当前tile的索引
+        int tiles_per_row = (outW / 2);
+        int p_local = idx % (tiles_per_row * (outH / 2));
+        int k = (idx / (tiles_per_row * (outH / 2))) % K;
+        int n = idx / (K * tiles_per_row * (outH / 2));
+        int tile_y = p_local / tiles_per_row;
+        int tile_x = p_local % tiles_per_row;
+
+        // 累加器寄存器 - 每个tile独立的累加器
+        register float m0 = 0.0f, m1 = 0.0f, m2 = 0.0f, m3 = 0.0f;
+        register float m4 = 0.0f, m5 = 0.0f, m6 = 0.0f, m7 = 0.0f;
+        register float m8 = 0.0f, m9 = 0.0f, m10 = 0.0f, m11 = 0.0f;
+        register float m12 = 0.0f, m13 = 0.0f, m14 = 0.0f, m15 = 0.0f;
+
+        // 预计算地址偏移
+        const float* base = image + n * C * H * W;
+        int h_start = tile_y * 2;
+        int w_start = tile_x * 2;
+
+        // 预计算地址偏移，避免在循环中重复计算
+        int addr0 = h_start * W + w_start;
+        int addr1 = addr0 + 1, addr2 = addr0 + 2, addr3 = addr0 + 3;
+        int addr4 = addr0 + W, addr5 = addr4 + 1, addr6 = addr4 + 2, addr7 = addr4 + 3;
+        int addr8 = addr0 + 2*W, addr9 = addr8 + 1, addr10 = addr8 + 2, addr11 = addr8 + 3;
+        int addr12 = addr0 + 3*W, addr13 = addr12 + 1, addr14 = addr12 + 2, addr15 = addr12 + 3;
+
+        // 循环处理所有输入通道
+        #pragma unroll 2  // 部分展开循环，平衡代码大小和性能
+        for (int c = 0; c < C; ++c) {
+            // 获取预计算的滤波器变换 - 直接用寄存器变量
+            const float* u_kc = filter + (k * C + c) * 16;
+            register float u0 = u_kc[0], u1 = u_kc[1], u2 = u_kc[2], u3 = u_kc[3];
+            register float u4 = u_kc[4], u5 = u_kc[5], u6 = u_kc[6], u7 = u_kc[7];
+            register float u8 = u_kc[8], u9 = u_kc[9], u10 = u_kc[10], u11 = u_kc[11];
+            register float u12 = u_kc[12], u13 = u_kc[13], u14 = u_kc[14], u15 = u_kc[15];
+            
+            // 直接加载输入数据到寄存器，避免数组
+            const float* channel_base = base + c * H * W;
+            register float d0, d1, d2, d3, d4, d5, d6, d7;
+            register float d8, d9, d10, d11, d12, d13, d14, d15;
+            
+            // 边界检查和加载 - 使用三元操作符减少分支
+            d0 = (h_start >= 0 && h_start < H && w_start >= 0 && w_start < W) ? channel_base[addr0] : 0.0f;
+            d1 = (h_start >= 0 && h_start < H && w_start + 1 >= 0 && w_start + 1 < W) ? channel_base[addr1] : 0.0f;
+            d2 = (h_start >= 0 && h_start < H && w_start + 2 >= 0 && w_start + 2 < W) ? channel_base[addr2] : 0.0f;
+            d3 = (h_start >= 0 && h_start < H && w_start + 3 >= 0 && w_start + 3 < W) ? channel_base[addr3] : 0.0f;
+            
+            d4 = (h_start + 1 >= 0 && h_start + 1 < H && w_start >= 0 && w_start < W) ? channel_base[addr4] : 0.0f;
+            d5 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 1 >= 0 && w_start + 1 < W) ? channel_base[addr5] : 0.0f;
+            d6 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 2 >= 0 && w_start + 2 < W) ? channel_base[addr6] : 0.0f;
+            d7 = (h_start + 1 >= 0 && h_start + 1 < H && w_start + 3 >= 0 && w_start + 3 < W) ? channel_base[addr7] : 0.0f;
+            
+            d8 = (h_start + 2 >= 0 && h_start + 2 < H && w_start >= 0 && w_start < W) ? channel_base[addr8] : 0.0f;
+            d9 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 1 >= 0 && w_start + 1 < W) ? channel_base[addr9] : 0.0f;
+            d10 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 2 >= 0 && w_start + 2 < W) ? channel_base[addr10] : 0.0f;
+            d11 = (h_start + 2 >= 0 && h_start + 2 < H && w_start + 3 >= 0 && w_start + 3 < W) ? channel_base[addr11] : 0.0f;
+            
+            d12 = (h_start + 3 >= 0 && h_start + 3 < H && w_start >= 0 && w_start < W) ? channel_base[addr12] : 0.0f;
+            d13 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 1 >= 0 && w_start + 1 < W) ? channel_base[addr13] : 0.0f;
+            d14 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 2 >= 0 && w_start + 2 < W) ? channel_base[addr14] : 0.0f;
+            d15 = (h_start + 3 >= 0 && h_start + 3 < H && w_start + 3 >= 0 && w_start + 3 < W) ? channel_base[addr15] : 0.0f;
+            
+            // 寄存器优化的输入变换：直接计算v值，不存储
+            // v = B^T @ d @ B 的手动展开版本，直接用于后续计算
+            register float v0 = d0 - d2 - d8 + d10;
+            register float v1 = d1 + d2 - d9 - d10;
+            register float v2 = -d1 + d2 + d9 - d10;
+            register float v3 = d1 - d3 - d9 + d11;
+            
+            register float v4 = d4 - d6 + d8 - d10;
+            register float v5 = d5 + d6 + d9 + d10;
+            register float v6 = -d5 + d6 - d9 + d10;
+            register float v7 = d5 - d7 + d9 - d11;
+            
+            register float v8 = -d4 + d6 + d8 - d10;
+            register float v9 = -d5 - d6 + d9 + d10;
+            register float v10 = d5 - d6 - d9 + d10;
+            register float v11 = -d5 + d7 + d9 - d11;
+            
+            register float v12 = d4 - d6 - d12 + d14;
+            register float v13 = d5 + d6 - d13 - d14;
+            register float v14 = -d5 + d6 + d13 - d14;
+            register float v15 = d5 - d7 - d13 + d15;
+
+            // 寄存器优化的元素级乘法：直接累加到m寄存器，使用融合乘加
+            m0 = fmaf(u0, v0, m0);
+            m1 = fmaf(u1, v1, m1);
+            m2 = fmaf(u2, v2, m2);
+            m3 = fmaf(u3, v3, m3);
+            
+            m4 = fmaf(u4, v4, m4);
+            m5 = fmaf(u5, v5, m5);
+            m6 = fmaf(u6, v6, m6);
+            m7 = fmaf(u7, v7, m7);
+            
+            m8 = fmaf(u8, v8, m8);
+            m9 = fmaf(u9, v9, m9);
+            m10 = fmaf(u10, v10, m10);
+            m11 = fmaf(u11, v11, m11);
+            
+            m12 = fmaf(u12, v12, m12);
+            m13 = fmaf(u13, v13, m13);
+            m14 = fmaf(u14, v14, m14);
+            m15 = fmaf(u15, v15, m15);
+        }
+
+        // 寄存器优化的输出变换：直接计算最终输出，不存储中间结果
+        // Y = A^T @ m @ A 的手动展开版本
+        register float Y0 = m0 + m1 + m2 + m4 + m5 + m6 + m8 + m9 + m10;
+        register float Y1 = m1 - m2 - m3 + m5 - m6 - m7 + m9 - m10 - m11;
+        register float Y2 = m4 + m5 + m6 - m8 - m9 - m10 - m12 - m13 - m14;
+        register float Y3 = m5 - m6 - m7 - m9 + m10 + m11 - m13 + m14 + m15;
+
+        // 优化的输出写入：预计算输出地址，减少重复计算
+        int out_base = (n * K + k) * outH * outW;
+        int h0 = tile_y * 2, w0 = tile_x * 2;
+        int h1 = h0 + 1, w1 = w0 + 1;
+        
+        // 条件写入，编译器会优化分支预测
+        if (h0 < outH && w0 < outW) output[out_base + h0 * outW + w0] = Y0;
+        if (h0 < outH && w1 < outW) output[out_base + h0 * outW + w1] = Y1;
+        if (h1 < outH && w0 < outW) output[out_base + h1 * outW + w0] = Y2;
+        if (h1 < outH && w1 < outW) output[out_base + h1 * outW + w1] = Y3;
+        
+        // 批处理优化：在处理下一个tile前，给其他指令一些执行时间
+        // 这有助于隐藏内存延迟，提高指令级并行度
+    }
+}
+
 void winograd_conv(thrust::device_vector<float>& image,
                    thrust::device_vector<float>& filter, 
                    thrust::device_vector<float>& out,
@@ -933,15 +894,20 @@ void winograd_conv(thrust::device_vector<float>& image,
     float sync_ratio = (float)(C * 3) / tiles_count;  // 同步开销与计算量比值
 
     
-    int total_work = N * K * tiles_x * tiles_y;
-    int threads_per_block = 256;
-    int num_blocks = (total_work + threads_per_block - 1) / threads_per_block;
+    // 批处理优化的线程块配置
+    const int TILES_PER_THREAD = 3;  // 与kernel中的参数保持一致
+    int total_tiles = N * K * tiles_x * tiles_y;
+    int total_threads_needed = (total_tiles + TILES_PER_THREAD - 1) / TILES_PER_THREAD;
+    
+    int threads_per_block = 256;  // 保持256线程，平衡占用率和性能
+    int num_blocks = (total_threads_needed + threads_per_block - 1) / threads_per_block;
         
-    // 使用指令流水线优化版本，减少分支和内存访问开销
-    winograd_conv_kernel_1D_optimized_pipeline<<<num_blocks, threads_per_block>>>(
+    // 使用批处理优化版本，每个线程处理多个tiles，提升计算密度
+    winograd_conv_kernel_1D_batched<<<num_blocks, threads_per_block>>>(
         image.data().get(), U.data().get(), out.data().get(),
         N, C, H, W, K, outH, outW
     );
     
     cudaDeviceSynchronize();
 }
+
